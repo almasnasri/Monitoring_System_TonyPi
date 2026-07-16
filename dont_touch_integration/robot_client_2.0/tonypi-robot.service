@@ -1,0 +1,21 @@
+[Unit]
+Description=TonyPi Robot Client (MQTT Telemetry + Camera)
+After=network.target mosquitto.service
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/robot_client
+ExecStart=/usr/bin/python3 /home/pi/robot_client/tonypi_client.py --broker 192.168.149.100
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Environment variables
+Environment=PYTHONUNBUFFERED=1
+Environment=MQTT_BROKER=192.168.149.100
+Environment=MQTT_PORT=1883
+
+[Install]
+WantedBy=multi-user.target

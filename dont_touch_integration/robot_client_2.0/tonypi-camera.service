@@ -1,0 +1,19 @@
+[Unit]
+Description=TonyPi Camera MJPEG Stream Server
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/robot_client
+ExecStart=/usr/bin/python3 /home/pi/robot_client/camera_stream.py --port 8081
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Environment variables
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

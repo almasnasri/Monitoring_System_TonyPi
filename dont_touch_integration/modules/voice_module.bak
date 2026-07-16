@@ -1,0 +1,39 @@
+import serial
+import os
+
+# --- COMMAND DICTIONARY ---
+# This belongs here because it defines the Voice Module's language.
+cmd_dict = {
+    b"\xaa\x55\x03\x00\xfb": 'wake_up',      
+    b"\xaa\x55\x00\x05\xfb": 'peeling',      
+    b"\xaa\x55\x00\x06\xfb": 'flip_over',    
+    b"\xaa\x55\x00\x07\xfb": 'pick_up',      
+    b"\xaa\x55\x00\x08\xfb": 'place_box',    
+    b"\xaa\x55\x00\x09\xfb": 'deliver',      
+    b"\xaa\x55\x00\x0A\xfb": 'stop_action'   
+}
+
+def speak(text):
+    """output voice via espeak"""
+    print(f"   [SPEAKING] '{text}'")
+    os.system(f'espeak -ven+f3 -s140 -a100 "{text}" &')
+
+class WonderEcho:
+    def __init__(self, port):
+        self.serialHandle = serial.Serial(None, 115200, serial.EIGHTBITS, serial.PARITY_NONE, serial.STOPBITS_ONE, timeout=0.02)
+        self.serialHandle.setPort(port)
+        self.serialHandle.open()
+        self.serialHandle.reset_input_buffer()
+
+    def get_command(self):
+        """
+        Reads serial data and returns the Command Name (string) directly.
+        Returns None if silence or unknown command.
+        """
+        data = self.serialHandle.read(5)
+        if data in cmd_dict:
+            return cmd_dict[data]
+        return None
+
+    def close(self):
+        self.serialHandle.close()

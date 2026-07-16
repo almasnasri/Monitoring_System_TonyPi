@@ -1,0 +1,331 @@
+#!/usr/bin/env python3
+import os
+import time
+import threading
+import subprocess
+import signal
+import sys
+from collections import deque
+from datetime import datetime
+
+import cv2
+import numpy as np
+from ultralytics import YOLO  # <-- Uses the full Ultralytics library
+
+# Automatically finds the file relative to this script
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+MODEL_PATH = os.path.join(BASE_DIR, "resources", "models", "cardboard_v1.pt")
+
+CAM_INDEX = 0
+FRAME_W, FRAME_H = 640, 480
+MODEL_INPUT_SIZE = 640
+CONF_THRESH = 0.1 # <-- Start with a low threshold
+DETECT_EVERY = 1 # Process every 2nd frame
+RESULT_HOLD_SECS = 2.0
+COOLDOWN_AFTER_ACTION = 5.0
+LOG_DIR = os.path.join(BASE_DIR, "logs")
+SCREEN_DIR = os.path.join(LOG_DIR, "screenshots")
+FUNCTIONS_DIR = os.path.join(BASE_DIR, "Functions")
+
+os.makedirs(LOG_DIR, exist_ok=True)
+os.makedirs(SCREEN_DIR, exist_ok=True)
+os.makedirs(FUNCTIONS_DIR, exist_ok=True)
+
+# This will be filled automatically when the model loads
+CLASS_NAMES = []
+ACTIONS = {
+    "CARDBOARD": "SheetFlipOver.py",
+}
+
+# --- 🛑 ACTION REQUIRED: IMPORT YOUR ROBOT'S LIBRARIES ---
+# from HiwonderSDK.Sonar import Sonar
+# ... etc.
+
+# ---------------- Mock Robot Hardware (REPLACE WITH REAL LIBRARY) ----------------
+class MockSonar:
+    def get_distance(self): return 100
+class MockArm:
+    def move_to(self, x, y, z): log_event(f"[MockArm] Moving to ({x}, {y}, {z})")
+    def home(self): log_event("[MockArm] Moving to Home Position")
+class MockChassis:
+    def set_velocity(self, v_x, v_y, v_turn):
+        if v_turn != 0: log_event(f"[MockChassis] Turning (speed={v_turn})")
+        elif v_x != 0: log_event(f"[MockChassis] Moving Forward (speed={v_x})")
+        else: log_event("[MockChassis] Stopping")
+    def stop(self): log_event("[MockChassis] STOPPING ALL MOVEMENT")
+
+sonar = MockSonar()
+arm = MockArm()
+chassis = MockChassis()
+# ----------------------------------------------------
+
+# --- State ---
+action_lock = threading.Lock()
+last_action_time = 0.0
+last_triggered_label = None
+dt_hist = deque(maxlen=30)
+# This global model object will be shared with the worker thread
+model = None 
+
+# ---------------- Utilities ----------------
+def log_event(message: str):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"{ts} | {message}\n"
+    with open(os.path.join(LOG_DIR, "detection_log.txt"), "a") as f:
+        f.write(line)
+    print(line.strip())
+
+def take_and_save_screenshot(frame, label):
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{ts}_{label}.jpg"
+    path = os.path.join(SCREEN_DIR, filename)
+    cv2.imwrite(path, frame)
+    log_event(f"Screenshot saved: {path}")
+    return path
+
+def run_action_script(script_name):
+    script_path = os.path.join(FUNCTIONS_DIR, script_name)
+    if not os.path.exists(script_path):
+        log_event(f"[WARN] Action script not found: {script_path}")
+        return False
+    log_event(f"[ACTION] Starting {script_name}")
+    try:
+        proc = subprocess.run(["python3", script_path], check=False, timeout=30)
+        rc = proc.returncode
+        log_event(f"[ACTION] {script_name} completed (rc={rc})")
+        return rc == 0
+    except Exception as e:
+        log_event(f"[ERROR] Exception while running {script_name}: {e}")
+        return False
+
+# ---------------- Robot Control Stubs (REPLACE WITH REAL LOGIC) ----------------
+def search_for_object_stub():
+    log_event("[SEARCH] Looking around for the object (stub).")
+    chassis.set_velocity(0, 0, 0.3) # Example: slow right turn
+    time.sleep(1.0) # Turn for 1 sec
+    chassis.stop()
+
+def approach_object_stub(box, frame_width):
+    log_event("[APPROACH] Centering on object (stub).")
+    x1, y1, x2, y2 = box
+    cx = (x1 + x2) / 2.0
+    center_offset = cx - (frame_width / 2.0)
+    
+    if abs(center_offset) > frame_width * 0.1: # 10% tolerance
+        if center_offset < 0: chassis.set_velocity(0, 0, -0.2) # Turn left
+        else: chassis.set_velocity(0, 0, 0.2) # Turn right
+        time.sleep(0.5)
+    chassis.stop()
+    
+    log_event("[MOVE] Move forward toward object (stub).")
+    chassis.set_velocity(0.2, 0, 0) # Move forward
+    time.sleep(1.0)
+    chassis.stop()
+
+# ---------------- Main Action Handler (Threaded) ----------------
+def handle_detection(label: str, conf: float, box: tuple, frame):
+    """This function runs in a separate thread to avoid blocking the camera feed."""
+    global last_action_time, last_triggered_label
+    
+    label_key = label.upper()
+    action_script = ACTIONS.get(label_key)
+    if action_script is None: return
+
+    now = time.time()
+    if last_triggered_label == label_key and (now - last_action_time) < COOLDOWN_AFTER_ACTION:
+        return
+
+    acquired = action_lock.acquire(blocking=False)
+    if not acquired: return
+        
+    try:
+        log_event(f"[TRIGGER] Handling '{label}' (conf={conf:.2f}).")
+        approach_object_stub(box, FRAME_W) 
+        success = run_action_script(action_script) 
+        saved_path = take_and_save_screenshot(frame, label_key)
+        status = "OK" if success else "ERROR"
+        log_event(f"[EVENT] label={label} conf={conf:.2f} action={action_script} status={status} screenshot={saved_path}")
+        last_action_time = time.time()
+        last_triggered_label = label_key
+    finally:
+        action_lock.release()
+
+def draw_hud(frame, fps, label=None):
+    def put_text(img, text, org):
+        cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 3, cv2.LINE_AA)
+        cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1, cv2.LINE_AA)
+    put_text(frame, f"Display FPS {fps:.1f}", (8,16))
+    if label:
+        put_text(frame, f"Detected: {label}", (8,36))
+
+# ---------------- Main loop ----------------
+def main_loop():
+    global model, CLASS_NAMES # Make model global
+    try:
+        log_event(f"[MODEL] Loading .pt model: {MODEL_PATH}")
+        model = YOLO(MODEL_PATH)
+        CLASS_NAMES = model.names
+        log_event(f"[MODEL] Model loaded. Class names: {CLASS_NAMES}")
+    except Exception as e:
+        log_event(f"[FATAL] Could not load .pt model: {e}")
+        return
+
+    cap = cv2.VideoCapture(CAM_INDEX)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
+    try: cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    except Exception: pass
+        
+    if not cap.isOpened():
+        log_event(f"[FATAL] Cannot open camera at index {CAM_INDEX}.")
+        return
+
+    # Threading queues
+    in_q = deque(maxlen=1)
+    out_q = deque(maxlen=1)
+    
+    # --- .PT (PyTorch) Inference Worker Thread ---
+    def worker():
+        log_event("[THREAD] .pt Inference worker started.")
+        while True:
+            if len(in_q) == 0:
+                time.sleep(0.005)
+                continue
+            
+            item = in_q.popleft()
+            if item is None: # Shutdown signal
+                log_event("[THREAD] Worker received shutdown signal.")
+                break
+                
+            ts, fcopy = item
+            try:
+                # 1. Run Inference
+                # This one line does all the work (pre/post-processing)
+                results = model(fcopy, imgsz=MODEL_INPUT_SIZE, conf=CONF_THRESH, verbose=False)
+
+                # 2. Parse results into our simple format
+                parsed_results = []
+                for box in results[0].boxes:
+                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+                    conf = float(box.conf[0].cpu().numpy())
+                    cls_id = int(box.cls[0].cpu().numpy())
+                    cls_name = CLASS_NAMES[cls_id]
+                    
+                    parsed_results.append({
+                         "cls_name": cls_name, 
+                         "conf": conf, 
+                         "box": (x1, y1, x2, y2)
+                    })
+                
+                # 3. Send results back to main thread
+                out_q.append((ts, parsed_results))
+                
+            except Exception as ex:
+                log_event(f"[ERROR] Inference exception: {ex}")
+                out_q.append((ts, [])) # Send empty result on error
+
+    wthread = threading.Thread(target=worker, daemon=True)
+    wthread.start()
+
+    log_event("[SYSTEM] VisionController started. Press 'q' to quit.")
+    last_fps_time = time.time()
+    frame_idx = 0
+    last_results = []
+    last_results_time = None
+
+    try:
+        while True:
+            # --- SAFETY CHECK: OBSTACLE SENSOR ---
+            distance = sonar.get_distance()
+            if distance < 20: 
+                chassis.stop()
+                log_event(f"[SAFETY] OBSTACLE DETECTED ({distance}cm) - STOPPING!")
+                ok, frame = cap.read()
+                if not ok: break
+                frame = cv2.resize(frame, (FRAME_W, FRAME_H))
+                cv2.putText(frame, "!!! OBSTACLE !!!", (FRAME_W//2 - 100, FRAME_H//2), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
+                cv2.imshow("VisionController Viewer", frame)
+                if cv2.waitKey(1) & 0xFF == ord('q'): break
+                continue
+            
+            # --- MAIN LOOP ---
+            ok, frame = cap.read()
+            if not ok:
+                log_event("[WARN] Failed to read frame from camera.")
+                break
+            
+            frame = cv2.resize(frame, (FRAME_W, FRAME_H))
+            frame_idx += 1
+
+            # --- Push frame to worker thread ---
+            if frame_idx % DETECT_EVERY == 0 and len(in_q) == 0:
+                in_q.append((time.time(), frame.copy()))
+
+            # --- Check for new results ---
+            while len(out_q) > 0:
+                ts, boxes = out_q.pop()
+                last_results = boxes
+                last_results_time = ts
+
+            # --- Draw boxes and handle detections ---
+            if last_results_time is not None and (time.time() - last_results_time) <= RESULT_HOLD_SECS:
+                for d in last_results:
+                    x1, y1, x2, y2 = d["box"]
+                    cls_name = d["cls_name"]
+                    conf = d["conf"]
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (60, 220, 60), 2)
+                    cv2.putText(frame, f"{cls_name} {conf:.2f}", (x1, max(15, y1 - 8)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (60, 220, 60), 1, cv2.LINE_AA)
+
+                # --- Handle action logic ---
+                candidate = None
+                best_conf = 0.0
+                for d in last_results:
+                    name = str(d["cls_name"])
+                    if name.upper() in ACTIONS and d["conf"] >= CONF_THRESH:
+                        if d["conf"] > best_conf:
+                            candidate = d
+                            best_conf = d["conf"]
+
+                if candidate:
+                    if not action_lock.locked():
+                        handler_frame = frame.copy()
+                        t = threading.Thread(target=handle_detection, 
+                                             args=(candidate["cls_name"], candidate["conf"], candidate["box"], handler_frame), 
+                                             daemon=True)
+                        t.start()
+            
+            # --- FPS calc (Measures display FPS) ---
+            now = time.time()
+            dt = now - last_fps_time
+            last_fps_time = now
+            dt_hist.append(dt)
+            fps = 1.0 / (sum(dt_hist) / len(dt_hist)) if len(dt_hist) > 0 else 0.0
+
+            draw_hud(frame, fps, label=(last_results[0]["cls_name"] if last_results else None))
+            cv2.imshow("VisionController Viewer", frame)
+            
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+                
+    finally:
+        # stop worker
+        in_q.append(None)
+        log_event("[SYSTEM] Shutting down VisionController.")
+        cap.release()
+        cv2.destroyAllWindows()
+        chassis.stop()
+        arm.home()
+        wthread.join(timeout=2.0)
+
+# ---------------- Safe exit handler ----------------
+def handle_exit(sig, frame):
+    log_event("[SYSTEM] Signal received; exiting.")
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, handle_exit)
+signal.signal(signal.SIGTERM, handle_exit)
+
+if __name__ == "__main__":
+    main_loop()

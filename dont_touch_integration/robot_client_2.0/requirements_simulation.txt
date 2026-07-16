@@ -1,0 +1,12 @@
+# Minimal Requirements for Simulation Mode
+# Use this on Raspberry Pi 4 or any system without TonyPi hardware
+# The client will automatically detect no hardware and run in simulation mode
+
+# Core MQTT communication (required)
+paho-mqtt>=2.0.0
+
+# System metrics (required for CPU, memory, disk, temperature)
+psutil>=5.9.0
+
+# Note: Hardware-specific libraries (pyserial, smbus2) are NOT needed
+# The client will gracefully handle missing hardware and use simulated data
